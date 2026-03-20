@@ -163,6 +163,9 @@ cython_debug/
 **/*.png
 plots/
 *.csv
+!kdd_test.csv
+!kdd_train.csv
+!nb15_kdd_train.csv
 *.npy
 *.pcap
 *.xlsx
