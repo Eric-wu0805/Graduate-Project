@@ -11,6 +11,7 @@ ACRL is a graduate research project that builds a **stacked deep-learning ensemb
 - [Included Artifacts (models & pickles)](#included-artifacts-models--pickles)
 - [Getting Started](#getting-started)
 - [Typical Workflow](#typical-workflow)
+- [Highlighted Pipeline: aclr_Robust_new.py](#highlighted-pipeline-aclr_robust_newpy)
 - [Script Reference](#script-reference)
 - [Supplementary Documentation](#supplementary-documentation)
 - [Notes](#notes)
@@ -89,8 +90,12 @@ The pipeline is designed to unify and cross-evaluate across:
 │   ├── aclr_KDD.py           Baseline pipeline on the KDD schema (primary/most complete script)
 │   ├── aclr_IDS.py           Generic IDS-schema training variant
 │   ├── aclr_KDD_smote_nc.py  KDD variant using SMOTE-NC (mixed categorical/numeric oversampling)
-│   ├── aclr_MinMax.py / aclr_Quantile.py / aclr_Robust.py / aclr_Robust_new.py
+│   ├── aclr_MinMax.py / aclr_Quantile.py / aclr_Robust.py
 │   │                          Same pipeline with different feature-scaling strategies
+│   ├── aclr_Robust_new.py     Most advanced single-file pipeline: 6-feature focused input,
+│   │                          RobustScaler + StandardScaler, XGBoost-importance-guided
+│   │                          "three-stage" random feature masking, early stopping, and
+│   │                          explicit L1/L2 regularization (see dedicated section below)
 │   ├── aclr_Per-Domain.py / kdd_Per-domain.py
 │   │                          Adds per-domain probability calibration (`CalibratedClassifierCV`)
 │   │                          for better cross-dataset transfer
@@ -159,7 +164,8 @@ Because training these models is expensive, a number of pre-trained artifacts ar
 | `final_meta_model.pkl`, `final_meta_model_rf.pkl` | Fitted meta-classifiers (XGBoost / Random-Forest variants) |
 | `final_scaler.pkl`, `feature_scalers.pkl`, `robust_scaler.pkl`, `standard_scaler.pkl` | Fitted `sklearn` scalers used to reproduce preprocessing at inference time |
 | `label_encoders.pkl`, `onehot_encoder.pkl` | Fitted categorical encoders |
-| `selected_features.pkl`, `selected_meta_features.pkl`, `feature_weights.pkl` | Feature-selection results from training |
+| `selected_features.pkl`, `selected_meta_features.pkl` | Feature-selection results from training |
+| `feature_weights.pkl` | Normalized XGBoost feature-importance scores produced by `aclr_Robust_new.py`, used to drive its importance-aware random-masking curriculum |
 | `model_config.pkl`, `*_params.pkl` | Saved hyperparameters/input sizes needed to reconstruct a model before loading its `state_dict` |
 | `KDD_final_*.pth/.pkl`, `NB15_final_*.pth/.pkl` | Dataset-specific final model/meta-model sets (KDD schema vs. NB15 schema) |
 | `ANN_best.pth`, `CNN_best.pth`, `RNN_best.pth`, `LSTM_best.pth`, `tuned_*.pth`, `best_FineTunable*Model.pth`, `best_ann_model.pth` | Checkpoints from hyperparameter-tuning / fine-tuning runs |
@@ -207,6 +213,31 @@ Only `kdd_train.csv`, `kdd_test.csv`, and `nb15_kdd_train.csv` are committed (ev
 3. **Evaluate** — run `test.py`, `kdd_test.py`, `IDS_testing.py`, or one of the other `*test*.py` scripts to reload the saved artifacts, score them on a held-out split, and (if a cross-dataset CSV is present) test generalization to a different dataset. These scripts print accuracy/precision/recall/F1/AUC and save ROC-curve and confusion-matrix plots.
 4. **Visualize / analyze** — use `chart.py`, `picture.py`, `pie.py`, `structure_pic.py`, `power_law.py`, or `analyze_attack_features*.py` to generate distribution plots, an architecture diagram, or per-attack-type feature reports.
 5. **Tune** (optional) — use `aclr_optuna_kdd.py`, `tuning_NB15.py`, `tuning_testing.py`, or `xgb_regularization_guide.py` to search hyperparameters, and `test_xgb_regularization.py` to compare regularization settings.
+
+## Highlighted Pipeline: `aclr_Robust_new.py`
+
+`aclr_Robust_new.py` is the most refined single-file training pipeline in the repo. It reuses the ACRL ensemble design (ANN + CNN + RNN + LSTM base learners stacked into an XGBoost meta-classifier) but adds several regularization and curriculum-learning techniques on top of the baseline `aclr.py` / `aclr_KDD.py` scripts:
+
+- **Focused feature set** — trains on `kdd_train.csv` / `kdd_test.csv` (KDD schema) but, instead of using all 41 columns, restricts the model to six hand-picked features: `src_bytes`, `dst_bytes`, `duration`, `same_srv_rate` (numerical) plus `protocol_type`, `flag` (categorical). `src_bytes`/`dst_bytes` get a `log1p` transform before IQR outlier clipping, per-feature `RobustScaler`, and a final `StandardScaler` over the combined numeric + label-encoded categorical matrix.
+- **XGBoost-derived feature importance** — before training the neural nets, a quick `XGBClassifier` is fit on the full preprocessed data purely to obtain `feature_importances_`, which are min-max normalized to `[0, 1]` and saved as `feature_weights.pkl`. These weights are *not* used for feature selection here — they drive the masking curriculum described below.
+- **Gaussian data augmentation** — `augment_data()` adds small Gaussian noise (`noise_level=0.05`) to a copy of the training matrix and appends it to the original data before SMOTE, roughly doubling the sample count.
+- **SMOTE oversampling + stratified split** — the augmented data is balanced with `SMOTE`, then split 80/20 (stratified) into train/validation sets.
+- **LayerNorm-augmented recurrent models** — unlike the base `RNNModel`/`LSTMModel` used elsewhere in the repo, this script's `RNNModel` and `LSTMModel` apply `nn.LayerNorm(64)` to the recurrent hidden state before the final linear+sigmoid head, for more stable training.
+- **Three-stage random feature masking** (`enable_three_stage_random_masking=True`) — a curriculum-style input dropout applied only during training, implemented in `_apply_random_masking()`:
+  - **Epochs 1–10**: fixed 5% element-wise mask probability.
+  - **Epochs 11–30**: probability ramps linearly from 5% up to 20% (`+0.75%` per epoch).
+  - **Epochs 31+**: fixed at 20%.
+  - The per-feature mask probability is further scaled by `1 − feature_importance`, so the six input features are masked less often the more important XGBoost judged them to be (`feature_weights` from the step above).
+- **Explicit L1/L2 regularization** — `l2_lambda` is passed as `weight_decay` to the `AdamW` optimizer (0.001 for ANN/CNN, 0.005 for RNN/LSTM in `main()`), and an optional manual L1 penalty (`l1_lambda`) can be added directly to the loss.
+- **Early stopping** — training runs up to 50 epochs per base model, but stops early (patience = 5 epochs without validation-loss improvement) and restores the best-validation-loss weights before saving.
+- **Dynamic class weighting** — same `DynamicClassWeighting` / `DynamicFocalLoss` mechanism as the rest of the ACRL family (`focal_adaptive` method, updated every 3 epochs).
+- **Meta-model** — stacks the four base learners' probabilities and fits an `XGBClassifier` (`reg_alpha=0.1`, `reg_lambda=1.0`, `max_depth=6`, `subsample=0.8`, `colsample_bytree=0.8`) with `scale_pos_weight` set from the class ratio, then reports Accuracy/Precision/Recall/F1/AUC on the training data.
+
+**Outputs**: `final_ann.pth`, `final_cnn.pth`, `final_rnn.pth`, `final_lstm.pth`, `final_meta_model.pkl`, `model_config.pkl`, plus the fitted preprocessors (`feature_scalers.pkl`, `label_encoders.pkl`, `final_scaler.pkl`, `selected_features.pkl`) and, uniquely to this script, `feature_weights.pkl` (the XGBoost-derived importance scores used for masking). Because it shares the `final_*` artifact filenames with the other `aclr*.py` scripts, running it will overwrite artifacts produced by a previous run of a different variant.
+
+```bash
+python aclr_Robust_new.py
+```
 
 ## Script Reference
 
